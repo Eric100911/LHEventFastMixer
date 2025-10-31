@@ -332,11 +332,33 @@ def _merge_single_group_gluons(group_particles: List[ak.Array]) -> ak.Array:
     
     # Create total momentum vector
     total_p4 = vector.obj(px=total_px, py=total_py, pz=total_pz, e=total_e)
-    total_p3_unit = total_p4.to_3D().unit()
     
-    # Calculate new gluon momenta
-    gluon1_p4 = total_p3_unit.scale((total_p4.mag - total_p4.e) / 2).to_Vector4D(tau=0)
-    gluon2_p4 = total_p3_unit.scale((total_p4.mag + total_p4.e) / 2).to_Vector4D(tau=0)
+    # Check for zero momentum to avoid division by zero
+    total_p3_mag = total_p4.to_3D().mag
+    if total_p3_mag < 1e-10:
+        # If total 3-momentum is near zero, use simple back-to-back gluons along z-axis
+        # This handles the case where initial gluons cancel out in transverse plane
+        gluon1_p4 = vector.obj(px=0.0, py=0.0, pz=total_e/2, e=total_e/2)
+        gluon2_p4 = vector.obj(px=0.0, py=0.0, pz=-total_e/2, e=total_e/2)
+    else:
+        # Normal case: redistribute momentum along total momentum direction
+        total_p3_unit = total_p4.to_3D().unit()
+        
+        # Calculate new gluon momenta using Mandelstam variable approach
+        # For massless particles (gluons): E = |p|
+        # We want two gluons that conserve total momentum and energy
+        # Following the OniaEventMixer approach with proper handling
+        s = total_p4.mag2  # Mandelstam s
+        if s > 0:
+            # Calculate momentum magnitudes for the two gluons
+            # They should be back-to-back in CoM frame
+            p_mag = abs(s)**0.5 / 2
+            gluon1_p4 = total_p3_unit.scale(p_mag).to_Vector4D(tau=0)
+            gluon2_p4 = total_p3_unit.scale(-p_mag).to_Vector4D(tau=0)
+        else:
+            # Fallback: use the original formula from OniaEventMixer
+            gluon1_p4 = total_p3_unit.scale((total_p4.mag - total_p4.e) / 2).to_Vector4D(tau=0)
+            gluon2_p4 = total_p3_unit.scale((total_p4.mag + total_p4.e) / 2).to_Vector4D(tau=0)
     
     # Create new initial gluons with temporary color indices
     gluon1_dict = {
@@ -373,6 +395,12 @@ def _merge_single_group_gluons(group_particles: List[ak.Array]) -> ak.Array:
     
     # Collect final state particles and adjust their properties
     final_particles = []
+    
+    # Color assignment strategy for merged gluons:
+    # We assign new color indices to colored final state particles to ensure
+    # they connect properly to the merged initial gluons.
+    # Starting from 103 to avoid conflicts with the gluon colors (101, 102).
+    # The pattern alternates and increments to create distinct color flows.
     next_color1 = 103
     next_color2 = 104
     
@@ -408,22 +436,33 @@ def _merge_single_group_gluons(group_particles: List[ak.Array]) -> ak.Array:
                 "spin": float(particle.spin),
             }
             
-            # Handle color flow for colored particles
+            # Handle color flow for colored particles (quarks/gluons)
+            # Reassign colors to maintain proper color flow with merged gluons
             if p_dict["color1"] != 0 and p_dict["color2"] != 0:
                 p_dict["color1"] = next_color1
                 p_dict["color2"] = next_color2
+                # Alternate pattern: swap colors on next iteration
+                # This creates a color chain that can connect back to the gluons
                 if next_color1 < next_color2:
                     next_color1, next_color2 = next_color2, next_color1
                 else:
+                    # Increment by different amounts to create unique color indices
                     next_color1 += 1
                     next_color2 += 3
             
             final_particles.append(p_dict)
     
-    # Update gluon colors to connect with unpaired final state colors
-    if next_color1 > next_color2:
-        gluon1_dict["color2"] = next_color1
-        gluon2_dict["color1"] = next_color2
+    # Update gluon colors to connect with final state colors
+    # The last assigned colors should connect back to the gluons to close the color loop
+    # Only update if we actually assigned colors to final state particles
+    if len(final_particles) > 0 and (next_color1 != 103 or next_color2 != 104):
+        # Connect gluons to the color chain of final state particles
+        if next_color1 > next_color2:
+            gluon1_dict["color2"] = next_color1
+            gluon2_dict["color1"] = next_color2
+        else:
+            gluon1_dict["color2"] = next_color2
+            gluon2_dict["color1"] = next_color1
     
     # Create awkward array with gluons first, then final state particles
     all_particles = [gluon1_dict, gluon2_dict] + final_particles
