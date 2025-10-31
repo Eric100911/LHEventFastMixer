@@ -6,6 +6,67 @@ import os
 import numpy as np
 import awkward as ak
 from typing import List, Dict, Union, Optional, Tuple
+import vector
+
+
+def validate_merge_recipe(
+    mix_recipe: List[int], merge_recipe: List[List[int]]
+) -> bool:
+    """
+    Validates that a merge recipe is compatible with a mix recipe.
+
+    Parameters
+    ----------
+    mix_recipe : List[int]
+        Recipe for mixing, where each integer corresponds to the number of events from each source.
+        Example: [2, 1, 3] means 2 events from source A, 1 from B, 3 from C.
+    merge_recipe : List[List[int]]
+        Recipe for merging sub-scatterings. Each sub-array indicates how many events from each
+        original source should be included in one merged sub-scattering.
+        Example: [[1, 1, 1], [1, 0, 0], [0, 0, 2]] means:
+        - First merged event: 1 from A, 1 from B, 1 from C
+        - Second merged event: 1 from A, 0 from B, 0 from C
+        - Third merged event: 0 from A, 0 from B, 2 from C
+
+    Returns
+    -------
+    bool
+        True if the merge recipe is compatible with the mix recipe.
+
+    Raises
+    ------
+    ValueError
+        If the merge recipe is invalid or incompatible with the mix recipe.
+    """
+    # Check that merge_recipe is not empty
+    if not merge_recipe:
+        raise ValueError("Merge recipe cannot be empty.")
+
+    # Check that all sub-arrays have the same length as mix_recipe
+    n_sources = len(mix_recipe)
+    for i, sub_recipe in enumerate(merge_recipe):
+        if len(sub_recipe) != n_sources:
+            raise ValueError(
+                f"Merge recipe sub-array {i} has length {len(sub_recipe)}, "
+                f"but should have length {n_sources} to match mix_recipe."
+            )
+
+    # Check that the sum of each column equals the corresponding mix_recipe value
+    merge_recipe_array = np.array(merge_recipe)
+    column_sums = np.sum(merge_recipe_array, axis=0)
+    mix_recipe_array = np.array(mix_recipe)
+
+    if not np.array_equal(column_sums, mix_recipe_array):
+        raise ValueError(
+            f"The sum of each column in merge_recipe {column_sums.tolist()} "
+            f"must equal the corresponding value in mix_recipe {mix_recipe}."
+        )
+
+    # Check that all values are non-negative integers
+    if not np.all(merge_recipe_array >= 0):
+        raise ValueError("All values in merge_recipe must be non-negative integers.")
+
+    return True
 
 
 def get_available_final_events_ak(
@@ -181,11 +242,180 @@ def lhe_particle_sort_by_status(particles: ak.Array) -> ak.Array:
     return sorted_particles
 
 
+def lhe_merge_gluons_ak(
+    particles: ak.Array, merge_groups: List[List[int]]
+) -> ak.Array:
+    """
+    Merges initial state gluons according to merge groups.
+    
+    This function takes particles grouped by sub-scattering and merges them according
+    to the merge recipe. For each merge group, it creates new initial gluons and
+    adjusts the color flow of final state particles.
+
+    Parameters
+    ----------
+    particles : ak.Array
+        Array of particles organized as [event, sub_scattering, particle].
+        The second dimension should match the total number of sub-scatterings from mix_recipe.
+    merge_groups : List[List[int]]
+        List of sub-scattering indices that should be merged together.
+        Each sub-list represents one merged event.
+        Example: [[0, 1], [2]] means merge sub-scatterings 0 and 1 into one event,
+        and keep sub-scattering 2 separate.
+
+    Returns
+    -------
+    ak.Array
+        Merged particles with updated initial gluons and color flow.
+    """
+    n_events = len(particles)
+    merged_events = []
+
+    for evt_idx in range(n_events):
+        event_particles = []
+        
+        for group in merge_groups:
+            # Collect particles from the specified sub-scatterings
+            group_particles = []
+            for sub_idx in group:
+                group_particles.append(particles[evt_idx, sub_idx])
+            
+            # Concatenate particles from this merge group
+            if len(group_particles) == 1:
+                # Single sub-scattering, no merging needed
+                merged_sub = group_particles[0]
+            else:
+                # Multiple sub-scatterings, need to merge gluons
+                merged_sub = _merge_single_group_gluons(group_particles)
+            
+            event_particles.append(merged_sub)
+        
+        # Concatenate all merged groups for this event
+        if len(event_particles) == 1:
+            merged_event = event_particles[0]
+        else:
+            merged_event = ak.concatenate(event_particles, axis=0)
+        
+        merged_events.append(merged_event)
+    
+    # Stack all events back together
+    result = ak.Array(merged_events)
+    return result
+
+
+def _merge_single_group_gluons(group_particles: List[ak.Array]) -> ak.Array:
+    """
+    Helper function to merge gluons for a single group of sub-scatterings.
+    
+    This implements the gluon squashing technique from OniaEventMixer.
+    """
+    # Calculate total beam momentum
+    total_px = 0.0
+    total_py = 0.0
+    total_pz = 0.0
+    total_e = 0.0
+    
+    for particles in group_particles:
+        initial_particles = particles[particles.status == -1]
+        total_px += ak.sum(initial_particles.px)
+        total_py += ak.sum(initial_particles.py)
+        total_pz += ak.sum(initial_particles.pz)
+        total_e += ak.sum(initial_particles.e)
+    
+    # Create total momentum vector
+    total_p4 = vector.obj(px=total_px, py=total_py, pz=total_pz, e=total_e)
+    total_p3_unit = total_p4.to_3D().unit()
+    
+    # Calculate new gluon momenta
+    gluon1_p4 = total_p3_unit.scale((total_p4.mag - total_p4.e) / 2).to_Vector4D(tau=0)
+    gluon2_p4 = total_p3_unit.scale((total_p4.mag + total_p4.e) / 2).to_Vector4D(tau=0)
+    
+    # Create new initial gluons with temporary color indices
+    gluon1_dict = {
+        "id": 21,
+        "status": -1,
+        "mother1": 0,
+        "mother2": 0,
+        "color1": 101,
+        "color2": 102,
+        "px": gluon1_p4.px,
+        "py": gluon1_p4.py,
+        "pz": gluon1_p4.pz,
+        "e": gluon1_p4.e,
+        "m": 0.0,
+        "lifetime": 0.0,
+        "spin": 0.0,
+    }
+    
+    gluon2_dict = {
+        "id": 21,
+        "status": -1,
+        "mother1": 0,
+        "mother2": 0,
+        "color1": 102,
+        "color2": 101,
+        "px": gluon2_p4.px,
+        "py": gluon2_p4.py,
+        "pz": gluon2_p4.pz,
+        "e": gluon2_p4.e,
+        "m": 0.0,
+        "lifetime": 0.0,
+        "spin": 0.0,
+    }
+    
+    # Collect final state particles and adjust their properties
+    final_particles = []
+    next_color1 = 103
+    next_color2 = 104
+    
+    for particles in group_particles:
+        final_state = particles[particles.status == 1]
+        for particle in final_state:
+            # Create modified particle dict
+            p_dict = {
+                "id": int(particle.id),
+                "status": 1,
+                "mother1": 1,  # Point to first gluon
+                "mother2": 2,  # Point to second gluon
+                "color1": int(particle.color1),
+                "color2": int(particle.color2),
+                "px": float(particle.px),
+                "py": float(particle.py),
+                "pz": float(particle.pz),
+                "e": float(particle.e),
+                "m": float(particle.m),
+                "lifetime": float(particle.lifetime),
+                "spin": float(particle.spin),
+            }
+            
+            # Handle color flow for colored particles
+            if p_dict["color1"] != 0 and p_dict["color2"] != 0:
+                p_dict["color1"] = next_color1
+                p_dict["color2"] = next_color2
+                if next_color1 < next_color2:
+                    next_color1, next_color2 = next_color2, next_color1
+                else:
+                    next_color1 += 1
+                    next_color2 += 3
+            
+            final_particles.append(p_dict)
+    
+    # Update gluon colors to connect with unpaired final state colors
+    if next_color1 > next_color2:
+        gluon1_dict["color2"] = next_color1
+        gluon2_dict["color1"] = next_color2
+    
+    # Create awkward array with gluons first, then final state particles
+    all_particles = [gluon1_dict, gluon2_dict] + final_particles
+    return ak.Array(all_particles)
+
+
 def lhe_event_ak_mixer(
     sources: List[ak.Array],
     mix_recipe: np.array,
     sources_count: Optional[List[int]] = None,
     sort_particles_by_status: bool = False,
+    merge_recipe: Optional[List[List[int]]] = None,
 ) -> ak.Array:
     """
     Mixes multiple LHEEvent arrays according to a recipe.
@@ -195,15 +425,29 @@ def lhe_event_ak_mixer(
     sources : List[ak.Array]
         List of events to mix, same format as obtained via `pylhe.to_awkward`.
     mix_recipe : List[int]
-        Recipe for mixing, where each integer corresponds to the index of the source array.
+        Recipe for mixing, where each integer corresponds to the number of events from each source.
+        Example: [2, 1, 3] means take 2 events from source A, 1 from B, 3 from C.
     sources_count : Optional[List[int]]
         Optional list specifying how many events to take from each source. If None, all events are taken.
+    sort_particles_by_status : bool, optional
+        If True, sorts particles by status in the final output. Default is False.
+    merge_recipe : Optional[List[List[int]]]
+        Recipe for merging sub-scatterings. Each sub-array indicates how many events from each
+        original source should be included in one merged sub-scattering.
+        Example: [[1, 1, 1], [1, 0, 0], [0, 0, 2]] for mix_recipe [2, 1, 3] means:
+        - First merged event: 1 from A, 1 from B, 1 from C (using gluon merging)
+        - Second merged event: 1 from A (no merging)
+        - Third merged event: 2 from C (using gluon merging)
+        If None, no gluon merging is performed (default behavior).
 
     Returns
     -------
     ak.Array
         An ak array representing LHE events, same format as obtained via `pylhe.to_awkward`.
     """
+    # Validate merge recipe if provided
+    if merge_recipe is not None:
+        validate_merge_recipe(mix_recipe, merge_recipe)
     # Get the number of available final events
     if len(sources) != len(mix_recipe):
         raise ValueError("Length of sources must match length of mix_recipe.")
@@ -260,8 +504,30 @@ def lhe_event_ak_mixer(
         source_particles_to_mix, "mother2", lineage_offset, keep_zeros=True
     )
 
-    # Further merge the particles into a single array, where each event contains the particles from all sources.
-    mixed_particles = ak.flatten(source_particles_to_mix, axis=2)
+    # Apply merge recipe if provided (gluon merging)
+    if merge_recipe is not None:
+        # Build merge groups: list of lists indicating which sub-scatterings to merge
+        merge_groups = []
+        sub_idx = 0
+        for merge_counts in merge_recipe:
+            group = []
+            for source_idx, count in enumerate(merge_counts):
+                for _ in range(count):
+                    group.append(sub_idx)
+                    sub_idx += 1
+            if group:  # Only add non-empty groups
+                merge_groups.append(group)
+        
+        # Apply gluon merging
+        source_particles_to_mix = lhe_merge_gluons_ak(
+            source_particles_to_mix, merge_groups
+        )
+        # After merging, particles are now [event, merged_group, particle]
+        # We need to flatten to [event, particle]
+        mixed_particles = ak.flatten(source_particles_to_mix, axis=1)
+    else:
+        # Further merge the particles into a single array, where each event contains the particles from all sources.
+        mixed_particles = ak.flatten(source_particles_to_mix, axis=2)
     # - Bringing back the px, py, pz, and E fields to the particles.
     mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.px, "px")
     mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.py, "py")
