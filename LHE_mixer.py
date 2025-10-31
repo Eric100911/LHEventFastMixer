@@ -298,8 +298,8 @@ def lhe_merge_gluons_ak(
         
         merged_events.append(merged_event)
     
-    # Stack all events back together
-    result = ak.Array(merged_events)
+    # Stack all events back together using ak.from_iter to preserve structure
+    result = ak.from_iter(merged_events)
     return result
 
 
@@ -317,10 +317,18 @@ def _merge_single_group_gluons(group_particles: List[ak.Array]) -> ak.Array:
     
     for particles in group_particles:
         initial_particles = particles[particles.status == -1]
-        total_px += ak.sum(initial_particles.px)
-        total_py += ak.sum(initial_particles.py)
-        total_pz += ak.sum(initial_particles.pz)
-        total_e += ak.sum(initial_particles.e)
+        
+        # Handle both vector and separate px, py, pz, e fields
+        if "px" in initial_particles.fields:
+            total_px += ak.sum(initial_particles.px)
+            total_py += ak.sum(initial_particles.py)
+            total_pz += ak.sum(initial_particles.pz)
+            total_e += ak.sum(initial_particles.e)
+        else:
+            total_px += ak.sum(initial_particles.vector.px)
+            total_py += ak.sum(initial_particles.vector.py)
+            total_pz += ak.sum(initial_particles.vector.pz)
+            total_e += ak.sum(initial_particles.vector.e)
     
     # Create total momentum vector
     total_p4 = vector.obj(px=total_px, py=total_py, pz=total_pz, e=total_e)
@@ -371,6 +379,18 @@ def _merge_single_group_gluons(group_particles: List[ak.Array]) -> ak.Array:
     for particles in group_particles:
         final_state = particles[particles.status == 1]
         for particle in final_state:
+            # Get momentum components (handle both formats)
+            if "px" in particles.fields:
+                px = float(particle.px)
+                py = float(particle.py)
+                pz = float(particle.pz)
+                e = float(particle.e)
+            else:
+                px = float(particle.vector.px)
+                py = float(particle.vector.py)
+                pz = float(particle.vector.pz)
+                e = float(particle.vector.e)
+            
             # Create modified particle dict
             p_dict = {
                 "id": int(particle.id),
@@ -379,10 +399,10 @@ def _merge_single_group_gluons(group_particles: List[ak.Array]) -> ak.Array:
                 "mother2": 2,  # Point to second gluon
                 "color1": int(particle.color1),
                 "color2": int(particle.color2),
-                "px": float(particle.px),
-                "py": float(particle.py),
-                "pz": float(particle.pz),
-                "e": float(particle.e),
+                "px": px,
+                "py": py,
+                "pz": pz,
+                "e": e,
                 "m": float(particle.m),
                 "lifetime": float(particle.lifetime),
                 "spin": float(particle.spin),
@@ -522,18 +542,19 @@ def lhe_event_ak_mixer(
         source_particles_to_mix = lhe_merge_gluons_ak(
             source_particles_to_mix, merge_groups
         )
-        # After merging, particles are now [event, merged_group, particle]
-        # We need to flatten to [event, particle]
-        mixed_particles = ak.flatten(source_particles_to_mix, axis=1)
+        # After merging, particles are already in [event, particle] format
+        mixed_particles = source_particles_to_mix
     else:
         # Further merge the particles into a single array, where each event contains the particles from all sources.
         mixed_particles = ak.flatten(source_particles_to_mix, axis=2)
-    # - Bringing back the px, py, pz, and E fields to the particles.
-    mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.px, "px")
-    mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.py, "py")
-    mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.pz, "pz")
-    mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.e, "e")
-    mixed_particles = ak.without_field(mixed_particles, "vector")
+    
+    # - Bringing back the px, py, pz, and E fields to the particles if vector field exists.
+    if "vector" in mixed_particles.fields:
+        mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.px, "px")
+        mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.py, "py")
+        mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.pz, "pz")
+        mixed_particles = ak.with_field(mixed_particles, mixed_particles.vector.e, "e")
+        mixed_particles = ak.without_field(mixed_particles, "vector")
 
     # - Optionally sort the particles by status.
     if sort_particles_by_status:
